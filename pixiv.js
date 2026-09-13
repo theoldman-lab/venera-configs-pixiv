@@ -3,7 +3,7 @@ class Pixiv extends ComicSource {
 
     key = "pixiv"
 
-    version = "0.1.1"
+    version = "0.1.2"
 
     minAppVersion = "1.6.0"
 
@@ -139,17 +139,39 @@ class Pixiv extends ComicSource {
 
     init() {
         this.preparePkce()
+        if (this.pkceVerifier) {
+            this.saveData('pkce_verifier', this.pkceVerifier)
+        }
     }
 
     account = (() => {
         const source = this
         return {
+            login: async (account, pwd) => {
+                let body = `client_id=${source.CLIENT_ID}&client_secret=${source.CLIENT_SECRET}` +
+                    `&grant_type=password&username=${encodeURIComponent(account)}` +
+                    `&password=${encodeURIComponent(pwd)}` +
+                    `&Device_token=pixiv&get_secure_url=true&include_policy=true`
+                let res = await Network.post(source.oauthUrl + '/auth/token',
+                    source.buildHeaders(false, "application/x-www-form-urlencoded"), body)
+                if (res.status !== 200) {
+                    throw 'Login failed: ' + res.body
+                }
+                let json = JSON.parse(res.body)
+                source.saveData('access_token', json.access_token)
+                source.saveData('refresh_token', json.refresh_token)
+                if (json.user) {
+                    source.saveData('user_id', String(json.user.id))
+                }
+                return 'ok'
+            },
+
             loginWithWebview: {
                 get url() {
                     return source.preparePkce()
                 },
                 checkStatus: (url, title) => {
-                    let match = url.match(/[?&]code=([^&]+)/)
+                    let match = url.match(/[?#&]code=([^&#]+)/)
                     if (match) {
                         if (source.pkceVerifier) {
                             source.saveData('pkce_verifier', source.pkceVerifier)
