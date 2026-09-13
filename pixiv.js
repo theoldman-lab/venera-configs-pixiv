@@ -3,7 +3,7 @@ class Pixiv extends ComicSource {
 
     key = "pixiv"
 
-    version = "0.1.0"
+    version = "0.1.1"
 
     minAppVersion = "1.6.0"
 
@@ -130,7 +130,7 @@ class Pixiv extends ComicSource {
         for (let i = 0; i < 128; i++) {
             verifier += charset[randomInt(0, charset.length - 1)]
         }
-        this.saveData('pkce_verifier', verifier)
+        this.pkceVerifier = verifier
         let challenge = Convert.encodeBase64(Convert.sha256(Convert.encodeUtf8(verifier)))
             .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
         this.loginUrl = `${this.BASE_API}/web/v1/login?code_challenge=${challenge}&code_challenge_method=S256&client=pixiv-android`
@@ -151,6 +151,9 @@ class Pixiv extends ComicSource {
                 checkStatus: (url, title) => {
                     let match = url.match(/[?&]code=([^&]+)/)
                     if (match) {
+                        if (source.pkceVerifier) {
+                            source.saveData('pkce_verifier', source.pkceVerifier)
+                        }
                         source.saveData('pkce_code', decodeURIComponent(match[1]))
                         return true
                     }
@@ -158,7 +161,7 @@ class Pixiv extends ComicSource {
                 },
                 onLoginSuccess: async () => {
                     let code = source.loadData('pkce_code')
-                    let verifier = source.loadData('pkce_verifier')
+                    let verifier = source.pkceVerifier || source.loadData('pkce_verifier')
                     if (!code || !verifier) {
                         throw 'Login failed: missing authorization code'
                     }
