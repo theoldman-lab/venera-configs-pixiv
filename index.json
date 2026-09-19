@@ -206,7 +206,7 @@
         "name": "Pixiv",
         "fileName": "pixiv.js",
         "key": "pixiv",
-        "version": "0.1.2",
-        "description": "Pixiv 第三方源, 支持账号密码登录; 登录后可使用关注与收藏功能"
+        "version": "0.2.0",
+        "description": "Pixiv 第三方源, 支持账号密码登录; 登录后可使用关注、收藏、评论与画师作品"
     }
 ]

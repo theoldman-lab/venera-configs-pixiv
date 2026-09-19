@@ -3,7 +3,7 @@ class Pixiv extends ComicSource {
 
     key = "pixiv"
 
-    version = "0.1.2"
+    version = "0.2.0"
 
     minAppVersion = "1.6.0"
 
@@ -77,11 +77,26 @@ class Pixiv extends ComicSource {
         return parts.length > 0 ? '?' + parts.join('&') : ''
     }
 
+    fixNextUrl(url) {
+        if (!url) return url
+        return url.replace(/^https?:\/\/[^/]+/, this.baseUrl)
+    }
+
+    needRefresh(res) {
+        if (!res) return false
+        if (res.status === 401) return !!this.loadData('refresh_token')
+        if (res.status === 400 && res.body && res.body.indexOf('OAuth') >= 0) {
+            return !!this.loadData('refresh_token')
+        }
+        return false
+    }
+
     async request(method, path, params, body, auth = true, contentType = null) {
-        let url = this.baseUrl + path + this.buildQuery(params)
+        let url = /^https?:\/\//.test(path) ? path : this.baseUrl + path
+        url += this.buildQuery(params)
         let res = await Network.sendRequest(method, url, this.buildHeaders(auth, contentType), body)
-        if (res.status === 400 && auth && res.body && res.body.indexOf('OAuth') >= 0 && this.loadData('refresh_token')) {
-            await this.refreshToken()
+        if (auth && this.needRefresh(res)) {
+            await this.ensureRefresh()
             res = await Network.sendRequest(method, url, this.buildHeaders(auth, contentType), body)
         }
         return res
@@ -95,11 +110,55 @@ class Pixiv extends ComicSource {
         return this.request('POST', path, null, body, auth, "application/x-www-form-urlencoded")
     }
 
+    apiDelete(path, params, auth = true) {
+        return this.request('DELETE', path, params, null, auth)
+    }
+
     check(res) {
         if (!res || res.status !== 200) {
-            throw `Invalid status code: ${res ? res.status : 'no response'}`
+            let detail = res && res.body ? String(res.body).substring(0, 300) : ''
+            throw `Invalid status code: ${res ? res.status : 'no response'}${detail ? ' - ' + detail : ''}`
         }
         return JSON.parse(res.body)
+    }
+
+    assertOk(res, message = 'Request failed') {
+        if (!res) {
+            throw message
+        }
+        if (res.status === 401 || (res.status === 400 && res.body && res.body.indexOf('OAuth') >= 0)) {
+            throw 'Login expired'
+        }
+        if (res.status !== 200) {
+            let detail = res.body ? String(res.body).substring(0, 300) : ''
+            throw `${message}: ${res.status}${detail ? ' - ' + detail : ''}`
+        }
+        return 'ok'
+    }
+
+    async loadIllustPage(next, path, params) {
+        let res = await this.apiGet(next || path, next ? null : params)
+        let json = this.check(res)
+        return {
+            comics: this.parseIllustList(json),
+            next: json.next_url ? this.fixNextUrl(json.next_url) : null,
+        }
+    }
+
+    ensureRefresh() {
+        if (!this._refreshPromise) {
+            this._refreshPromise = this.refreshToken().then(
+                (v) => {
+                    this._refreshPromise = null
+                    return v
+                },
+                (e) => {
+                    this._refreshPromise = null
+                    throw e
+                }
+            )
+        }
+        return this._refreshPromise
     }
 
     async refreshToken() {
@@ -144,6 +203,30 @@ class Pixiv extends ComicSource {
         }
     }
 
+    parseAuthError(body) {
+        if (!body) return 'unknown error'
+        try {
+            let json = JSON.parse(body)
+            if (json.errors) {
+                for (let key in json.errors) {
+                    let err = json.errors[key]
+                    if (err && err.message) return err.message
+                }
+            }
+            if (json.error) return json.error
+        } catch (e) {
+        }
+        return String(body).substring(0, 300)
+    }
+
+    saveToken(json) {
+        this.saveData('access_token', json.access_token)
+        this.saveData('refresh_token', json.refresh_token)
+        if (json.user) {
+            this.saveData('user_id', String(json.user.id))
+        }
+    }
+
     account = (() => {
         const source = this
         return {
@@ -155,14 +238,13 @@ class Pixiv extends ComicSource {
                 let res = await Network.post(source.oauthUrl + '/auth/token',
                     source.buildHeaders(false, "application/x-www-form-urlencoded"), body)
                 if (res.status !== 200) {
-                    throw 'Login failed: ' + res.body
+                    let msg = source.parseAuthError(res.body)
+                    if (/captcha|verify|challenge/i.test(msg)) {
+                        msg += ' (Pixiv 要求人机验证, 请改用网页登录)'
+                    }
+                    throw 'Login failed: ' + msg
                 }
-                let json = JSON.parse(res.body)
-                source.saveData('access_token', json.access_token)
-                source.saveData('refresh_token', json.refresh_token)
-                if (json.user) {
-                    source.saveData('user_id', String(json.user.id))
-                }
+                source.saveToken(JSON.parse(res.body))
                 return 'ok'
             },
 
@@ -194,14 +276,9 @@ class Pixiv extends ComicSource {
                         `&include_policy=true`
                     let res = await Network.post(source.oauthUrl + '/auth/token', source.buildHeaders(false, "application/x-www-form-urlencoded"), body)
                     if (res.status !== 200) {
-                        throw 'Login failed: ' + res.body
+                        throw 'Login failed: ' + source.parseAuthError(res.body)
                     }
-                    let json = JSON.parse(res.body)
-                    source.saveData('access_token', json.access_token)
-                    source.saveData('refresh_token', json.refresh_token)
-                    if (json.user) {
-                        source.saveData('user_id', String(json.user.id))
-                    }
+                    source.saveToken(JSON.parse(res.body))
                     return 'ok'
                 },
             },
@@ -211,6 +288,7 @@ class Pixiv extends ComicSource {
                 source.deleteData('refresh_token')
                 source.deleteData('user_id')
                 source.deleteData('pkce_code')
+                source.deleteData('pkce_verifier')
             },
 
             registerWebsite: "https://accounts.pixiv.net/signup"
@@ -287,46 +365,36 @@ class Pixiv extends ComicSource {
         {
             title: "推荐插画",
             type: "multiPageComicList",
-            load: async (page) => {
-                let res = await this.apiGet('/v1/illust/recommended', {
-                    filter: 'for_android',
-                    include_ranking_label: true,
-                })
-                return { comics: this.parseIllustList(this.check(res)), maxPage: 1 }
-            },
+            loadNext: (next) => this.loadIllustPage(next, '/v1/illust/recommended', {
+                filter: 'for_android',
+                include_ranking_label: true,
+            }),
         },
         {
             title: "推荐漫画",
             type: "multiPageComicList",
-            load: async (page) => {
-                let res = await this.apiGet('/v1/manga/recommended', {
-                    filter: 'for_android',
-                    include_ranking_label: true,
-                })
-                return { comics: this.parseIllustList(this.check(res)), maxPage: 1 }
-            },
+            loadNext: (next) => this.loadIllustPage(next, '/v1/manga/recommended', {
+                filter: 'for_android',
+                include_ranking_label: true,
+            }),
         },
         {
             title: "关注新作",
             type: "multiPageComicList",
-            load: async (page) => {
+            loadNext: async (next) => {
                 if (!this.isLogged) {
                     throw 'Not logged in'
                 }
-                let res = await this.apiGet('/v2/illust/follow', { restrict: 'all' })
-                return { comics: this.parseIllustList(this.check(res)), maxPage: 1 }
+                return this.loadIllustPage(next, '/v2/illust/follow', { restrict: 'all' })
             },
         },
         {
             title: "综合日榜",
             type: "multiPageComicList",
-            load: async (page) => {
-                let res = await this.apiGet('/v1/illust/ranking', {
-                    filter: 'for_android',
-                    mode: 'day',
-                })
-                return { comics: this.parseIllustList(this.check(res)), maxPage: 1 }
-            },
+            loadNext: (next) => this.loadIllustPage(next, '/v1/illust/ranking', {
+                filter: 'for_android',
+                mode: 'day',
+            }),
         },
         {
             title: "热门标签",
@@ -374,17 +442,67 @@ class Pixiv extends ComicSource {
         enableRankingPage: true,
     }
 
+    pagedMax(json, page) {
+        return json && json.next_url ? page + 1 : page
+    }
+
+    async resolveUserId(nameOrId) {
+        if (/^\d+$/.test(String(nameOrId))) {
+            return String(nameOrId)
+        }
+        let res = await this.apiGet('/v1/search/user', {
+            filter: 'for_android',
+            word: nameOrId,
+        })
+        let json = this.check(res)
+        let previews = json.user_previews || []
+        if (previews.length > 0 && previews[0].user) {
+            return String(previews[0].user.id)
+        }
+        return null
+    }
+
     categoryComics = {
         load: async (category, param, options, page) => {
+            let offset = (page - 1) * 30
+            let sort = (options && options[0]) || 'date_desc'
+            if (category === 'artist') {
+                let userId = await this.resolveUserId(param)
+                if (!userId) {
+                    return { comics: [], maxPage: page }
+                }
+                let res = await this.apiGet('/v1/user/illusts', {
+                    filter: 'for_android',
+                    user_id: userId,
+                    type: 'illust',
+                    offset: offset || null,
+                })
+                let json = this.check(res)
+                return { comics: this.parseIllustList(json), maxPage: this.pagedMax(json, page) }
+            }
             let res = await this.apiGet('/v1/search/illust', {
                 filter: 'for_android',
                 merge_plain_keyword_results: true,
                 word: param || category,
                 search_target: 'exact_match_for_tags',
-                sort: 'date_desc',
+                sort: sort,
+                offset: offset || null,
             })
-            return { comics: this.parseIllustList(this.check(res)), maxPage: 1 }
+            let json = this.check(res)
+            return { comics: this.parseIllustList(json), maxPage: this.pagedMax(json, page) }
         },
+
+        optionList: [
+            {
+                label: "排序",
+                options: [
+                    "date_desc-最新",
+                    "date_asc-最早",
+                    "popular_desc-热门",
+                ],
+                notShowWhen: ['artist'],
+            },
+        ],
 
         ranking: {
             options: [
@@ -397,27 +515,34 @@ class Pixiv extends ComicSource {
                 "week_original-原创周榜",
             ],
             load: async (option, page) => {
+                let offset = (page - 1) * 30
                 let res = await this.apiGet('/v1/illust/ranking', {
                     filter: 'for_android',
                     mode: option,
+                    offset: offset || null,
                 })
-                return { comics: this.parseIllustList(this.check(res)), maxPage: 1 }
+                let json = this.check(res)
+                return { comics: this.parseIllustList(json), maxPage: this.pagedMax(json, page) }
             },
         },
     }
 
     search = {
-        load: async (keyword, options, page) => {
+        loadNext: async (keyword, options, next) => {
             let sort = options[0] || 'date_desc'
             let target = options[1] || 'partial_match_for_tags'
-            let res = await this.apiGet('/v1/search/illust', {
+            let res = await this.apiGet(next || '/v1/search/illust', next ? null : {
                 filter: 'for_android',
                 merge_plain_keyword_results: true,
                 word: keyword,
                 sort: sort,
                 search_target: target,
             })
-            return { comics: this.parseIllustList(this.check(res)), maxPage: 1 }
+            let json = this.check(res)
+            return {
+                comics: this.parseIllustList(json),
+                next: json.next_url ? this.fixNextUrl(json.next_url) : null,
+            }
         },
 
         optionList: [
@@ -438,6 +563,38 @@ class Pixiv extends ComicSource {
                 ],
             },
         ],
+
+        enableTagsSuggestions: true,
+
+        onTagSuggestionSelected: (namespace, tag) => tag,
+    }
+
+    tagFolderId(restrict, name) {
+        return 'tag:' + (restrict || 'public') + ':' + name
+    }
+
+    parseTagFolder(folderId) {
+        if (!folderId || folderId.indexOf('tag:') !== 0) return null
+        let rest = folderId.substring(4)
+        let idx = rest.indexOf(':')
+        if (idx < 0) return null
+        return { restrict: rest.substring(0, idx), name: rest.substring(idx + 1) }
+    }
+
+    buildBookmarkBody(comicId, restrict, tags) {
+        let body = `illust_id=${encodeURIComponent(comicId)}&restrict=${encodeURIComponent(restrict || 'public')}`
+        for (let tag of (tags || [])) {
+            body += `&tags[]=${encodeURIComponent(tag)}`
+        }
+        return body
+    }
+
+    async getBookmarkDetail(comicId) {
+        let res = await this.apiGet('/v2/illust/bookmark/detail', { illust_id: comicId })
+        if (res.status !== 200) {
+            return null
+        }
+        return JSON.parse(res.body).bookmark_detail || null
     }
 
     favorites = {
@@ -447,21 +604,40 @@ class Pixiv extends ComicSource {
             if (!this.isLogged) {
                 throw 'Login expired'
             }
-            let res
-            if (isAdding) {
-                res = await this.apiPost('/v2/illust/bookmark/add',
-                    `illust_id=${encodeURIComponent(comicId)}&restrict=${encodeURIComponent(folderId || 'public')}`)
-            } else {
-                res = await this.apiPost('/v1/illust/bookmark/delete',
-                    `illust_id=${encodeURIComponent(comicId)}`)
+            let parts = this.parseTagFolder(folderId)
+            if (!isAdding) {
+                if (!parts) {
+                    let res = await this.apiPost('/v1/illust/bookmark/delete',
+                        `illust_id=${encodeURIComponent(comicId)}`)
+                    return this.assertOk(res, 'Failed to delete favorite')
+                }
+                let detail = await this.getBookmarkDetail(comicId)
+                if (!detail || !detail.is_bookmarked) {
+                    return 'ok'
+                }
+                let remaining = (detail.tags || [])
+                    .map(t => t.name)
+                    .filter(n => n !== parts.name)
+                let res = await this.apiPost('/v2/illust/bookmark/add',
+                    this.buildBookmarkBody(comicId, detail.restrict || parts.restrict || 'public', remaining))
+                return this.assertOk(res, 'Failed to update favorite')
             }
-            if (res.status === 401 || (res.status === 400 && res.body && res.body.indexOf('OAuth') >= 0)) {
-                throw 'Login expired'
+            if (!parts) {
+                let detail = await this.getBookmarkDetail(comicId)
+                let tags = detail && detail.is_bookmarked ? (detail.tags || []).map(t => t.name) : []
+                let res = await this.apiPost('/v2/illust/bookmark/add',
+                    this.buildBookmarkBody(comicId, folderId, tags))
+                return this.assertOk(res, 'Failed to add favorite')
             }
-            if (res.status !== 200) {
-                throw 'Invalid status code: ' + res.status
+            let detail = await this.getBookmarkDetail(comicId)
+            let restrict = detail && detail.is_bookmarked && detail.restrict ? detail.restrict : parts.restrict
+            let tags = detail && detail.is_bookmarked ? (detail.tags || []).map(t => t.name) : []
+            if (tags.indexOf(parts.name) < 0) {
+                tags.push(parts.name)
             }
-            return 'ok'
+            let res = await this.apiPost('/v2/illust/bookmark/add',
+                this.buildBookmarkBody(comicId, restrict, tags))
+            return this.assertOk(res, 'Failed to add favorite')
         },
 
         loadFolders: async (comicId) => {
@@ -473,32 +649,82 @@ class Pixiv extends ComicSource {
                 'private': '私密收藏',
             }
             let favorited = []
+            let detail = null
             if (comicId) {
                 try {
-                    let res = await this.apiGet('/v2/illust/bookmark/detail', { illust_id: comicId })
+                    detail = await this.getBookmarkDetail(comicId)
+                } catch (e) {
+                }
+            }
+            let userId = this.loadData('user_id')
+            for (let restrict of ['public', 'private']) {
+                try {
+                    let res = await this.apiGet('/v1/user/bookmark-tags/illust', {
+                        user_id: userId || null,
+                        restrict: restrict,
+                    })
                     if (res.status === 200) {
-                        let detail = JSON.parse(res.body).bookmark_detail
-                        if (detail && detail.is_bookmarked) {
-                            favorited = ['public']
+                        let json = JSON.parse(res.body)
+                        for (let tag of (json.bookmark_tags || [])) {
+                            folders[this.tagFolderId(restrict, tag.name)] = `${tag.name} (${tag.count})`
                         }
                     }
                 } catch (e) {
                 }
             }
+            if (detail && detail.is_bookmarked) {
+                let restrict = detail.restrict || 'public'
+                favorited.push(restrict)
+                for (let tag of (detail.tags || [])) {
+                    favorited.push(this.tagFolderId(restrict, tag.name))
+                }
+            }
             return { folders: folders, favorited: favorited }
         },
 
-        loadComics: async (page, folder) => {
+        addFolder: async (name) => {
+            let res = await this.apiPost('/v1/user/bookmark-tags/illust',
+                `tag=${encodeURIComponent(name)}&restrict=public`)
+            return this.assertOk(res, 'Failed to add folder')
+        },
+
+        deleteFolder: async (folderId) => {
+            let parts = this.parseTagFolder(folderId)
+            if (!parts) {
+                throw 'Invalid folder'
+            }
+            let res = await this.apiDelete('/v1/user/bookmark-tags/illust', {
+                tag: parts.name,
+                restrict: parts.restrict,
+            })
+            return this.assertOk(res, 'Failed to delete folder')
+        },
+
+        loadNext: async (next, folder) => {
             let userId = this.loadData('user_id')
             if (!userId) {
                 throw 'Login expired'
             }
-            let res = await this.apiGet('/v1/user/bookmarks/illust', {
+            let restrict = 'public'
+            let tag = null
+            let parts = this.parseTagFolder(folder)
+            if (parts) {
+                restrict = parts.restrict
+                tag = parts.name
+            } else if (folder === 'private') {
+                restrict = 'private'
+            }
+            let res = await this.apiGet(next || '/v1/user/bookmarks/illust', next ? null : {
                 user_id: userId,
-                restrict: folder || 'public',
+                restrict: restrict,
+                tag: tag,
                 filter: 'for_android',
             })
-            return { comics: this.parseIllustList(this.check(res)), maxPage: 1 }
+            let json = this.check(res)
+            return {
+                comics: this.parseIllustList(json),
+                next: json.next_url ? this.fixNextUrl(json.next_url) : null,
+            }
         },
 
         singleFolderForSingleComic: false,
@@ -524,6 +750,9 @@ class Pixiv extends ComicSource {
             } catch (e) {
             }
             let tags = {}
+            if (illust.user) {
+                tags['作者'] = [illust.user.name]
+            }
             tags['标签'] = (illust.tags || []).map(tag => tag.name)
             let chapters = {}
             if ((illust.page_count || 1) > 1) {
@@ -572,6 +801,26 @@ class Pixiv extends ComicSource {
             return { images: images }
         },
 
+        loadThumbnails: async (id, next) => {
+            let res = await this.apiGet('/v1/illust/detail', {
+                illust_id: id,
+                filter: 'for_android',
+            })
+            let illust = this.check(res).illust
+            let quality = this.loadSetting('imageQuality') || 'large'
+            let thumbQuality = quality === 'original' ? 'large' : quality
+            let thumbnails = []
+            if (illust.meta_pages && illust.meta_pages.length > 0) {
+                for (let page of illust.meta_pages) {
+                    let url = this.pickPageUrl(page.image_urls, thumbQuality)
+                    if (url) {
+                        thumbnails.push(this.rewriteHost(url))
+                    }
+                }
+            }
+            return { thumbnails: thumbnails, next: null }
+        },
+
         onImageLoad: (url, comicId, epId) => {
             return {
                 url: this.rewriteHost(url),
@@ -594,25 +843,50 @@ class Pixiv extends ComicSource {
 
         loadComments: async (comicId, subId, page, replyTo) => {
             let comments = []
+            let json
             if (replyTo) {
-                let res = await this.apiGet('/v2/illust/comment/replies', { comment_id: replyTo })
-                let json = this.check(res)
-                for (let item of (json.comments || [])) {
-                    comments.push(this.parseComment(item))
-                }
+                let res = await this.apiGet('/v2/illust/comment/replies', {
+                    comment_id: replyTo,
+                    offset: page > 1 ? (page - 1) * 20 : null,
+                })
+                json = this.check(res)
             } else {
-                let res = await this.apiGet('/v3/illust/comments', { illust_id: comicId })
-                let json = this.check(res)
-                for (let item of (json.comments || [])) {
-                    comments.push(this.parseComment(item))
-                }
+                let res = await this.apiGet('/v3/illust/comments', {
+                    illust_id: comicId,
+                    offset: page > 1 ? (page - 1) * 20 : null,
+                })
+                json = this.check(res)
             }
-            return { comments: comments, maxPage: 1 }
+            for (let item of (json.comments || [])) {
+                comments.push(this.parseComment(item))
+            }
+            return { comments: comments, maxPage: json.next_url ? page + 1 : page }
+        },
+
+        sendComment: async (comicId, subId, content, replyTo) => {
+            if (!this.isLogged) {
+                throw 'Login expired'
+            }
+            let body = `illust_id=${encodeURIComponent(comicId)}&comment=${encodeURIComponent(content)}`
+            if (replyTo) {
+                body += `&parent_comment_id=${encodeURIComponent(replyTo)}`
+            }
+            let res = await this.apiPost('/v1/illust/comment/add', body)
+            return this.assertOk(res, 'Failed to send comment')
         },
 
         idMatch: "^(\\d+)$",
 
         onClickTag: (namespace, tag) => {
+            if (namespace === '作者') {
+                return {
+                    page: 'category',
+                    attributes: {
+                        category: 'artist',
+                        param: tag,
+                    },
+                }
+            }
             return {
                 page: 'search',
                 attributes: {
@@ -631,6 +905,8 @@ class Pixiv extends ComicSource {
                 return match ? match[1] : null
             },
         },
+
+        enableTagsTranslate: true,
     }
 
     parseComment(item) {
@@ -712,6 +988,7 @@ class Pixiv extends ComicSource {
             '原创周榜': '原创周榜',
             '公开收藏': '公开收藏',
             '私密收藏': '私密收藏',
+            '作者': '作者',
             '标签': '标签',
             'API 地址': 'API 地址',
             'OAuth 地址': 'OAuth 地址',
@@ -746,6 +1023,7 @@ class Pixiv extends ComicSource {
             '原创周榜': '原創週榜',
             '公开收藏': '公開收藏',
             '私密收藏': '私密收藏',
+            '作者': '作者',
             '标签': '標籤',
             'API 地址': 'API 位址',
             'OAuth 地址': 'OAuth 位址',
@@ -780,6 +1058,7 @@ class Pixiv extends ComicSource {
             '原创周榜': 'Weekly Original',
             '公开收藏': 'Public',
             '私密收藏': 'Private',
+            '作者': 'Artist',
             '标签': 'Tags',
             'API 地址': 'API Host',
             'OAuth 地址': 'OAuth Host',
