@@ -3,7 +3,7 @@ class Pixiv extends ComicSource {
 
     key = "pixiv"
 
-    version = "0.3.0"
+    version = "0.3.1"
 
     minAppVersion = "1.6.0"
 
@@ -266,6 +266,7 @@ class Pixiv extends ComicSource {
         if (this.pkceVerifier) {
             this.saveData('pkce_verifier', this.pkceVerifier)
         }
+        this.refreshTrendTags()
     }
 
     parseAuthError(body) {
@@ -479,24 +480,68 @@ class Pixiv extends ComicSource {
         },
     ]
 
+    static fallbackTags = [
+        { label: 'オリジナル', tag: 'オリジナル' },
+        { label: '初音ミク', tag: '初音ミク' },
+        { label: '女の子', tag: '女の子' },
+        { label: 'イラスト', tag: 'イラスト' },
+        { label: 'Fate/GrandOrder', tag: 'Fate/GrandOrder' },
+        { label: 'ブルーアーカイブ', tag: 'ブルーアーカイブ' },
+        { label: 'ホロライブ', tag: 'ホロライブ' },
+        { label: '原神', tag: '原神' },
+        { label: '東方Project', tag: '東方Project' },
+        { label: 'ラブライブ!', tag: 'ラブライブ!' },
+        { label: '呪術廻戦', tag: '呪術廻戦' },
+        { label: '鬼滅の刃', tag: '鬼滅の刃' },
+        { label: 'ウマ娘', tag: 'ウマ娘' },
+        { label: 'にじさんじ', tag: 'にじさんじ' },
+        { label: 'VTuber', tag: 'VTuber' },
+        { label: '創作', tag: '創作' },
+    ]
+
+    getTrendTags() {
+        let cached = this.loadData('trend_tags')
+        if (Array.isArray(cached) && cached.length > 0) {
+            return cached
+        }
+        return Pixiv.fallbackTags
+    }
+
+    refreshTrendTags() {
+        return this.apiGet('/v1/trending-tags/illust', { filter: 'for_android' }).then(
+            (res) => {
+                if (res.status !== 200) {
+                    return
+                }
+                let json = JSON.parse(res.body)
+                let tags = []
+                for (let item of (json.trend_tags || [])) {
+                    tags.push({ label: item.translated_name || item.tag, tag: item.tag })
+                }
+                if (tags.length > 0) {
+                    this.saveData('trend_tags', tags)
+                }
+            },
+            () => { }
+        )
+    }
+
     category = {
         title: "Pixiv",
         parts: [
             {
                 name: "热门标签",
                 type: "dynamic",
-                loader: async () => {
-                    let res = await this.apiGet('/v1/trending-tags/illust', { filter: 'for_android' })
-                    let json = this.check(res)
+                loader: () => {
                     let items = []
-                    for (let item of (json.trend_tags || [])) {
+                    for (let t of this.getTrendTags()) {
                         items.push({
-                            label: item.translated_name || item.tag,
+                            label: t.label,
                             target: {
                                 page: 'category',
                                 attributes: {
                                     category: 'tag',
-                                    param: item.tag,
+                                    param: t.tag,
                                 },
                             },
                         })
