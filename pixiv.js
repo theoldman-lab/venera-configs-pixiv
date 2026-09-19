@@ -3,7 +3,7 @@ class Pixiv extends ComicSource {
 
     key = "pixiv"
 
-    version = "0.3.2"
+    version = "0.3.3"
 
     minAppVersion = "1.6.0"
 
@@ -925,6 +925,11 @@ class Pixiv extends ComicSource {
                     if (url) {
                         thumbnails.push(this.rewriteHost(url))
                     }
+                }
+            } else {
+                let url = this.pickSingleUrl(illust, thumbQuality)
+                if (url) {
+                    thumbnails.push(this.rewriteHost(url))
                 }
             }
             return { thumbnails: thumbnails, next: null }
