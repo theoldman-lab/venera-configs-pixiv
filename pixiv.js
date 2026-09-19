@@ -3,7 +3,7 @@ class Pixiv extends ComicSource {
 
     key = "pixiv"
 
-    version = "0.3.1"
+    version = "0.3.2"
 
     minAppVersion = "1.6.0"
 
@@ -585,7 +585,6 @@ class Pixiv extends ComicSource {
                 let res = await this.apiGet('/v1/user/illusts', {
                     filter: 'for_android',
                     user_id: userId,
-                    type: 'illust',
                     offset: offset || null,
                 })
                 let json = this.check(res)
