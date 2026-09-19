@@ -3,7 +3,7 @@ class Pixiv extends ComicSource {
 
     key = "pixiv"
 
-    version = "0.2.0"
+    version = "0.3.0"
 
     minAppVersion = "1.6.0"
 
@@ -43,7 +43,68 @@ class Pixiv extends ComicSource {
         return Convert.hexEncode(Convert.md5(Convert.encodeUtf8(time + this.HASH_SALT)))
     }
 
-    buildHeaders(auth = true, contentType = null) {
+    subAccounts() {
+        try {
+            let arr = JSON.parse(this.loadSetting('sub_accounts') || '[]')
+            return Array.isArray(arr) ? arr : []
+        } catch (e) {
+            return []
+        }
+    }
+
+    accountCount() {
+        return 1 + this.subAccounts().length
+    }
+
+    accountName(index) {
+        if (index === 0) {
+            return '主账号'
+        }
+        let sub = this.subAccounts()[index - 1]
+        return sub && sub.name ? sub.name : `账号${index}`
+    }
+
+    get activeAccount() {
+        let value = this.loadData('active_account')
+        let index = value === null || value === undefined || value === '' ? 0 : Number(value)
+        if (isNaN(index) || index < 0) {
+            return 0
+        }
+        return index
+    }
+
+    accountTokenKey(index) {
+        return index === 0 ? 'access_token' : `access_token_${index}`
+    }
+
+    accountRefreshKey(index) {
+        return index === 0 ? 'refresh_token' : `refresh_token_${index}`
+    }
+
+    accountUserIdKey(index) {
+        return index === 0 ? 'user_id' : `user_id_${index}`
+    }
+
+    hasAccount(index) {
+        return !!this.loadData(this.accountTokenKey(index))
+    }
+
+    getUserId(index) {
+        let i = index === undefined ? this.activeAccount : index
+        return this.loadData(this.accountUserIdKey(i))
+    }
+
+    requireAccount() {
+        if (this.hasAccount(this.activeAccount)) {
+            return
+        }
+        if (this.activeAccount === 0) {
+            throw 'Login expired'
+        }
+        throw '当前账号未登录, 请在设置中登录附属账号或切换账号'
+    }
+
+    buildHeaders(auth = true, contentType = null, accountIndex = null) {
         let time = this.isoTime()
         let headers = {
             "X-Client-Time": time,
@@ -58,7 +119,8 @@ class Pixiv extends ComicSource {
             headers["Content-Type"] = contentType
         }
         if (auth) {
-            let token = this.loadData('access_token')
+            let index = accountIndex === null || accountIndex === undefined ? this.activeAccount : accountIndex
+            let token = this.loadData(this.accountTokenKey(index))
             if (token) {
                 headers["Authorization"] = "Bearer " + token
             }
@@ -82,22 +144,24 @@ class Pixiv extends ComicSource {
         return url.replace(/^https?:\/\/[^/]+/, this.baseUrl)
     }
 
-    needRefresh(res) {
+    needRefresh(res, accountIndex) {
         if (!res) return false
-        if (res.status === 401) return !!this.loadData('refresh_token')
+        let index = accountIndex === undefined ? this.activeAccount : accountIndex
+        if (res.status === 401) return !!this.loadData(this.accountRefreshKey(index))
         if (res.status === 400 && res.body && res.body.indexOf('OAuth') >= 0) {
-            return !!this.loadData('refresh_token')
+            return !!this.loadData(this.accountRefreshKey(index))
         }
         return false
     }
 
-    async request(method, path, params, body, auth = true, contentType = null) {
+    async request(method, path, params, body, auth = true, contentType = null, accountIndex = null) {
+        let index = accountIndex === null || accountIndex === undefined ? this.activeAccount : accountIndex
         let url = /^https?:\/\//.test(path) ? path : this.baseUrl + path
         url += this.buildQuery(params)
-        let res = await Network.sendRequest(method, url, this.buildHeaders(auth, contentType), body)
-        if (auth && this.needRefresh(res)) {
-            await this.ensureRefresh()
-            res = await Network.sendRequest(method, url, this.buildHeaders(auth, contentType), body)
+        let res = await Network.sendRequest(method, url, this.buildHeaders(auth, contentType, index), body)
+        if (auth && this.needRefresh(res, index)) {
+            await this.ensureRefresh(index)
+            res = await Network.sendRequest(method, url, this.buildHeaders(auth, contentType, index), body)
         }
         return res
     }
@@ -145,24 +209,29 @@ class Pixiv extends ComicSource {
         }
     }
 
-    ensureRefresh() {
-        if (!this._refreshPromise) {
-            this._refreshPromise = this.refreshToken().then(
+    ensureRefresh(accountIndex) {
+        let index = accountIndex === undefined ? this.activeAccount : accountIndex
+        if (!this._refreshPromises) {
+            this._refreshPromises = {}
+        }
+        if (!this._refreshPromises[index]) {
+            this._refreshPromises[index] = this.refreshToken(index).then(
                 (v) => {
-                    this._refreshPromise = null
+                    this._refreshPromises[index] = null
                     return v
                 },
                 (e) => {
-                    this._refreshPromise = null
+                    this._refreshPromises[index] = null
                     throw e
                 }
             )
         }
-        return this._refreshPromise
+        return this._refreshPromises[index]
     }
 
-    async refreshToken() {
-        let refreshToken = this.loadData('refresh_token')
+    async refreshToken(accountIndex) {
+        let index = accountIndex === undefined ? this.activeAccount : accountIndex
+        let refreshToken = this.loadData(this.accountRefreshKey(index))
         if (!refreshToken) {
             throw 'Login expired'
         }
@@ -172,12 +241,7 @@ class Pixiv extends ComicSource {
         if (res.status !== 200) {
             throw 'Login expired'
         }
-        let json = JSON.parse(res.body)
-        this.saveData('access_token', json.access_token)
-        this.saveData('refresh_token', json.refresh_token)
-        if (json.user) {
-            this.saveData('user_id', String(json.user.id))
-        }
+        this.saveToken(JSON.parse(res.body), index)
     }
 
     preparePkce() {
@@ -197,6 +261,7 @@ class Pixiv extends ComicSource {
     }
 
     init() {
+        this._refreshPromises = {}
         this.preparePkce()
         if (this.pkceVerifier) {
             this.saveData('pkce_verifier', this.pkceVerifier)
@@ -219,11 +284,11 @@ class Pixiv extends ComicSource {
         return String(body).substring(0, 300)
     }
 
-    saveToken(json) {
-        this.saveData('access_token', json.access_token)
-        this.saveData('refresh_token', json.refresh_token)
+    saveToken(json, accountIndex = 0) {
+        this.saveData(this.accountTokenKey(accountIndex), json.access_token)
+        this.saveData(this.accountRefreshKey(accountIndex), json.refresh_token)
         if (json.user) {
-            this.saveData('user_id', String(json.user.id))
+            this.saveData(this.accountUserIdKey(accountIndex), String(json.user.id))
         }
     }
 
@@ -244,7 +309,8 @@ class Pixiv extends ComicSource {
                     }
                     throw 'Login failed: ' + msg
                 }
-                source.saveToken(JSON.parse(res.body))
+                source.saveToken(JSON.parse(res.body), 0)
+                source.saveData('active_account', '0')
                 return 'ok'
             },
 
@@ -278,7 +344,8 @@ class Pixiv extends ComicSource {
                     if (res.status !== 200) {
                         throw 'Login failed: ' + source.parseAuthError(res.body)
                     }
-                    source.saveToken(JSON.parse(res.body))
+                    source.saveToken(JSON.parse(res.body), 0)
+                    source.saveData('active_account', '0')
                     return 'ok'
                 },
             },
@@ -289,6 +356,7 @@ class Pixiv extends ComicSource {
                 source.deleteData('user_id')
                 source.deleteData('pkce_code')
                 source.deleteData('pkce_verifier')
+                source.deleteData('active_account')
             },
 
             registerWebsite: "https://accounts.pixiv.net/signup"
@@ -382,9 +450,7 @@ class Pixiv extends ComicSource {
             title: "关注新作",
             type: "multiPageComicList",
             loadNext: async (next) => {
-                if (!this.isLogged) {
-                    throw 'Not logged in'
-                }
+                this.requireAccount()
                 return this.loadIllustPage(next, '/v2/illust/follow', { restrict: 'all' })
             },
         },
@@ -507,12 +573,17 @@ class Pixiv extends ComicSource {
         ranking: {
             options: [
                 "day-日榜",
-                "week-周榜",
-                "month-月榜",
                 "day_male-男性向日榜",
                 "day_female-女性向日榜",
-                "week_rookie-新人周榜",
                 "week_original-原创周榜",
+                "week_rookie-新人周榜",
+                "week-周榜",
+                "month-月榜",
+                "day_ai-AI 日榜",
+                "day_r18_ai-R18 AI 日榜",
+                "day_r18-R18 日榜",
+                "week_r18-R18 周榜",
+                "week_r18g-R18G 周榜",
             ],
             load: async (option, page) => {
                 let offset = (page - 1) * 30
@@ -601,9 +672,7 @@ class Pixiv extends ComicSource {
         multiFolder: true,
 
         addOrDelFavorite: async (comicId, folderId, isAdding, favoriteId) => {
-            if (!this.isLogged) {
-                throw 'Login expired'
-            }
+            this.requireAccount()
             let parts = this.parseTagFolder(folderId)
             if (!isAdding) {
                 if (!parts) {
@@ -641,9 +710,7 @@ class Pixiv extends ComicSource {
         },
 
         loadFolders: async (comicId) => {
-            if (!this.isLogged) {
-                throw 'Login expired'
-            }
+            this.requireAccount()
             let folders = {
                 'public': '公开收藏',
                 'private': '私密收藏',
@@ -656,7 +723,7 @@ class Pixiv extends ComicSource {
                 } catch (e) {
                 }
             }
-            let userId = this.loadData('user_id')
+            let userId = this.getUserId()
             for (let restrict of ['public', 'private']) {
                 try {
                     let res = await this.apiGet('/v1/user/bookmark-tags/illust', {
@@ -701,10 +768,8 @@ class Pixiv extends ComicSource {
         },
 
         loadNext: async (next, folder) => {
-            let userId = this.loadData('user_id')
-            if (!userId) {
-                throw 'Login expired'
-            }
+            this.requireAccount()
+            let userId = this.getUserId()
             let restrict = 'public'
             let tag = null
             let parts = this.parseTagFolder(folder)
@@ -864,9 +929,7 @@ class Pixiv extends ComicSource {
         },
 
         sendComment: async (comicId, subId, content, replyTo) => {
-            if (!this.isLogged) {
-                throw 'Login expired'
-            }
+            this.requireAccount()
             let body = `illust_id=${encodeURIComponent(comicId)}&comment=${encodeURIComponent(content)}`
             if (replyTo) {
                 body += `&parent_comment_id=${encodeURIComponent(replyTo)}`
@@ -961,6 +1024,78 @@ class Pixiv extends ComicSource {
             validator: null,
             default: "",
         },
+        sub_accounts: {
+            title: "附属账号列表",
+            type: "input",
+            validator: null,
+            default: "[]",
+            description: "JSON 数组, 格式 [{\"name\":\"小号1\",\"username\":\"用户名\",\"password\":\"密码\"}]; 密码明文存储",
+        },
+        login_sub_accounts: {
+            title: "登录附属账号",
+            type: "callback",
+            buttonText: "登录所有附属账号",
+            callback: async () => {
+                let subs = this.subAccounts()
+                if (subs.length === 0) {
+                    UI.showMessage("请先在附属账号列表中添加账号")
+                    return
+                }
+                let ok = 0
+                for (let i = 0; i < subs.length; i++) {
+                    let acc = subs[i]
+                    try {
+                        let body = `client_id=${this.CLIENT_ID}&client_secret=${this.CLIENT_SECRET}` +
+                            `&grant_type=password&username=${encodeURIComponent(acc.username)}` +
+                            `&password=${encodeURIComponent(acc.password)}` +
+                            `&Device_token=pixiv&get_secure_url=true&include_policy=true`
+                        let res = await Network.post(this.oauthUrl + '/auth/token',
+                            this.buildHeaders(false, "application/x-www-form-urlencoded"), body)
+                        if (res.status === 200) {
+                            this.saveToken(JSON.parse(res.body), i + 1)
+                            ok++
+                        } else {
+                            UI.showMessage(`${this.accountName(i + 1)}: ${this.parseAuthError(res.body)}`)
+                        }
+                    } catch (e) {
+                        UI.showMessage(`${this.accountName(i + 1)}: ${e}`)
+                    }
+                }
+                UI.showMessage(`附属账号登录: ${ok}/${subs.length} 成功`)
+            },
+        },
+        clear_sub_accounts: {
+            title: "清除附属账号",
+            type: "callback",
+            buttonText: "清除所有附属账号TOKEN",
+            callback: () => {
+                let subs = this.subAccounts()
+                for (let i = 0; i < subs.length; i++) {
+                    this.deleteData(`access_token_${i + 1}`)
+                    this.deleteData(`refresh_token_${i + 1}`)
+                    this.deleteData(`user_id_${i + 1}`)
+                }
+                this.saveData('active_account', '0')
+                UI.showMessage("已清除所有附属账号TOKEN")
+            },
+        },
+        switch_account: {
+            title: "切换当前账号",
+            type: "callback",
+            buttonText: "选择当前账号",
+            callback: async () => {
+                let options = []
+                for (let i = 0; i < this.accountCount(); i++) {
+                    options.push(`${this.accountName(i)}${this.hasAccount(i) ? '' : ' (未登录)'}`)
+                }
+                let index = await UI.showSelectDialog("选择当前账号", options, Math.min(this.activeAccount, this.accountCount() - 1))
+                if (index === null || index === undefined) {
+                    return
+                }
+                this.saveData('active_account', String(index))
+                UI.showMessage(`已切换到 ${this.accountName(index)}`)
+            },
+        },
     }
 
     translation = {
@@ -986,6 +1121,11 @@ class Pixiv extends ComicSource {
             '女性向日榜': '女性向日榜',
             '新人周榜': '新人周榜',
             '原创周榜': '原创周榜',
+            'AI 日榜': 'AI 日榜',
+            'R18 AI 日榜': 'R18 AI 日榜',
+            'R18 日榜': 'R18 日榜',
+            'R18 周榜': 'R18 周榜',
+            'R18G 周榜': 'R18G 周榜',
             '公开收藏': '公开收藏',
             '私密收藏': '私密收藏',
             '作者': '作者',
@@ -999,6 +1139,10 @@ class Pixiv extends ComicSource {
             '原图': '原图',
             '自定义': '自定义',
             '自定义图片域名': '自定义图片域名',
+            '附属账号列表': '附属账号列表',
+            '登录附属账号': '登录附属账号',
+            '清除附属账号': '清除附属账号',
+            '切换当前账号': '切换当前账号',
         },
         'zh_TW': {
             '推荐插画': '推薦插畫',
@@ -1021,6 +1165,11 @@ class Pixiv extends ComicSource {
             '女性向日榜': '女性向日榜',
             '新人周榜': '新人週榜',
             '原创周榜': '原創週榜',
+            'AI 日榜': 'AI 日榜',
+            'R18 AI 日榜': 'R18 AI 日榜',
+            'R18 日榜': 'R18 日榜',
+            'R18 周榜': 'R18 週榜',
+            'R18G 周榜': 'R18G 週榜',
             '公开收藏': '公開收藏',
             '私密收藏': '私密收藏',
             '作者': '作者',
@@ -1034,6 +1183,10 @@ class Pixiv extends ComicSource {
             '原图': '原圖',
             '自定义': '自訂',
             '自定义图片域名': '自訂圖片網域',
+            '附属账号列表': '附屬帳號列表',
+            '登录附属账号': '登入附屬帳號',
+            '清除附属账号': '清除附屬帳號',
+            '切换当前账号': '切換目前帳號',
         },
         'en': {
             '推荐插画': 'Recommended Illustrations',
@@ -1056,6 +1209,11 @@ class Pixiv extends ComicSource {
             '女性向日榜': 'Daily Female',
             '新人周榜': 'Weekly Rookie',
             '原创周榜': 'Weekly Original',
+            'AI 日榜': 'Daily AI',
+            'R18 AI 日榜': 'Daily R18 AI',
+            'R18 日榜': 'Daily R18',
+            'R18 周榜': 'Weekly R18',
+            'R18G 周榜': 'Weekly R18G',
             '公开收藏': 'Public',
             '私密收藏': 'Private',
             '作者': 'Artist',
@@ -1069,6 +1227,10 @@ class Pixiv extends ComicSource {
             '原图': 'Original',
             '自定义': 'Custom',
             '自定义图片域名': 'Custom Image Host',
+            '附属账号列表': 'Sub-accounts',
+            '登录附属账号': 'Login Sub-accounts',
+            '清除附属账号': 'Clear Sub-accounts',
+            '切换当前账号': 'Switch Account',
         },
     }
 }
