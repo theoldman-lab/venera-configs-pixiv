@@ -3,7 +3,7 @@ class Pixiv extends ComicSource {
 
     key = "pixiv"
 
-    version = "0.3.3"
+    version = "0.4.1"
 
     minAppVersion = "1.6.0"
 
@@ -267,6 +267,7 @@ class Pixiv extends ComicSource {
             this.saveData('pkce_verifier', this.pkceVerifier)
         }
         this.refreshTrendTags()
+        this.refreshRecommendUsers()
     }
 
     parseAuthError(body) {
@@ -312,6 +313,7 @@ class Pixiv extends ComicSource {
                 }
                 source.saveToken(JSON.parse(res.body), 0)
                 source.saveData('active_account', '0')
+                source.refreshRecommendUsers()
                 return 'ok'
             },
 
@@ -347,11 +349,13 @@ class Pixiv extends ComicSource {
                     }
                     source.saveToken(JSON.parse(res.body), 0)
                     source.saveData('active_account', '0')
+                    source.refreshRecommendUsers()
                     return 'ok'
                 },
             },
 
             logout: () => {
+                source.deleteData(source.recommendUsersKey())
                 source.deleteData('access_token')
                 source.deleteData('refresh_token')
                 source.deleteData('user_id')
@@ -428,6 +432,44 @@ class Pixiv extends ComicSource {
 
     parseIllustList(json) {
         return (json.illusts || []).map(illust => this.parseComic(illust))
+    }
+
+    // 拉取插画所属系列的全部作品 (用于把 Pixiv 连载映射为章节); 无系列或失败时返回 null
+    async fetchSeriesIllusts(illust) {
+        if (!illust || !illust.series || !illust.series.id) {
+            return null
+        }
+        try {
+            let list = []
+            let next = null
+            // 防御性上限: 最多翻 5 页, 避免超长系列拖慢详情页
+            for (let i = 0; i < 5; i++) {
+                let res = await this.apiGet(next || '/v1/illust-series/illust',
+                    next ? null : { illust_id: illust.id })
+                if (res.status !== 200) {
+                    break
+                }
+                let json = JSON.parse(res.body)
+                for (let item of (json.illusts || [])) {
+                    list.push(item)
+                }
+                next = json.next_url ? this.fixNextUrl(json.next_url) : null
+                if (!next) {
+                    break
+                }
+            }
+            if (list.length <= 1) {
+                return null
+            }
+            // 接口返回顺序为新 -> 旧, 按投稿时间升序还原阅读顺序
+            return list.sort((a, b) => {
+                let ta = a.create_date ? Date.parse(a.create_date) : 0
+                let tb = b.create_date ? Date.parse(b.create_date) : 0
+                return ta - tb
+            })
+        } catch (e) {
+            return null
+        }
     }
 
     explore = [
@@ -526,6 +568,43 @@ class Pixiv extends ComicSource {
         )
     }
 
+    // 推荐画师按账号隔离缓存 (推荐结果是账号个性化的), 供同步 dynamic loader 读取
+    recommendUsersKey() {
+        let userId = this.getUserId()
+        return userId ? `recommend_users_${userId}` : 'recommend_users'
+    }
+
+    getRecommendUsers() {
+        let cached = this.loadData(this.recommendUsersKey())
+        return Array.isArray(cached) ? cached : []
+    }
+
+    // 后台刷新推荐画师; 未登录时静默跳过, 失败静默忽略
+    refreshRecommendUsers() {
+        if (!this.hasAccount(this.activeAccount)) {
+            return
+        }
+        return this.apiGet('/v1/user/recommended', { filter: 'for_android' }).then(
+            (res) => {
+                if (res.status !== 200) {
+                    return
+                }
+                let json = JSON.parse(res.body)
+                let users = []
+                for (let item of (json.user_previews || [])) {
+                    let user = item.user
+                    if (user && user.id) {
+                        users.push({ name: user.name || String(user.id), id: String(user.id) })
+                    }
+                }
+                if (users.length > 0) {
+                    this.saveData(this.recommendUsersKey(), users)
+                }
+            },
+            () => { }
+        )
+    }
+
     category = {
         title: "Pixiv",
         parts: [
@@ -542,6 +621,26 @@ class Pixiv extends ComicSource {
                                 attributes: {
                                     category: 'tag',
                                     param: t.tag,
+                                },
+                            },
+                        })
+                    }
+                    return items
+                },
+            },
+            {
+                name: "推荐画师",
+                type: "dynamic",
+                loader: () => {
+                    let items = []
+                    for (let u of this.getRecommendUsers()) {
+                        items.push({
+                            label: u.name,
+                            target: {
+                                page: 'category',
+                                attributes: {
+                                    category: 'artist',
+                                    param: u.id,
                                 },
                             },
                         })
@@ -864,7 +963,14 @@ class Pixiv extends ComicSource {
             }
             tags['标签'] = (illust.tags || []).map(tag => tag.name)
             let chapters = {}
-            if ((illust.page_count || 1) > 1) {
+            let series = await this.fetchSeriesIllusts(illust)
+            if (series) {
+                // 连载系列: 每件作品作为一个章节, 章节 id 为该作品的 illust id
+                for (let i = 0; i < series.length; i++) {
+                    let work = series[i]
+                    chapters[String(work.id)] = work.title || `第 ${i + 1} 篇`
+                }
+            } else if ((illust.page_count || 1) > 1) {
                 chapters['0'] = `1-${illust.page_count}`
             }
             return new ComicDetails({
@@ -887,8 +993,11 @@ class Pixiv extends ComicSource {
         },
 
         loadEp: async (comicId, epId) => {
+            // 系列章节的 epId 是系列中另一件作品的 illust id;
+            // 单作品多页时章节 id 为 '0', 需回退到 comicId
+            let targetId = epId && epId !== '0' ? epId : comicId
             let res = await this.apiGet('/v1/illust/detail', {
-                illust_id: comicId,
+                illust_id: targetId,
                 filter: 'for_android',
             })
             let illust = this.check(res).illust
@@ -1034,6 +1143,30 @@ class Pixiv extends ComicSource {
         })
     }
 
+    async loadAiShowSetting() {
+        this.requireAccount()
+        let res = await this.apiGet('/v1/user/ai-show-settings')
+        return !!this.check(res).show_ai
+    }
+
+    async setAiShowSetting(show) {
+        let res = await this.apiPost('/v1/user/ai-show-settings/edit',
+            `show_ai=${show ? 'true' : 'false'}`)
+        return this.assertOk(res, 'Failed to update AI display setting')
+    }
+
+    async loadRestrictedModeSetting() {
+        this.requireAccount()
+        let res = await this.apiGet('/v1/user/restricted-mode-settings')
+        return !!this.check(res).is_restricted_mode_enabled
+    }
+
+    async setRestrictedModeSetting(enabled) {
+        let res = await this.apiPost('/v1/user/restricted-mode-settings',
+            `is_restricted_mode_enabled=${enabled ? 'true' : 'false'}`)
+        return this.assertOk(res, 'Failed to update restricted mode setting')
+    }
+
     settings = {
         apiHost: {
             title: "API 地址",
@@ -1072,6 +1205,67 @@ class Pixiv extends ComicSource {
             type: "input",
             validator: null,
             default: "",
+        },
+        ai_show_settings: {
+            title: "AI 作品显示",
+            type: "callback",
+            buttonText: "查询 / 切换",
+            callback: async () => {
+                try {
+                    let current = await this.loadAiShowSetting()
+                    let index = await UI.showSelectDialog("AI 作品显示",
+                        ["显示 AI 作品", "隐藏 AI 作品"], current ? 0 : 1)
+                    if (index === null || index === undefined) {
+                        return
+                    }
+                    let next = index === 0
+                    if (next === current) {
+                        UI.showMessage("未更改")
+                        return
+                    }
+                    await this.setAiShowSetting(next)
+                    UI.showMessage(`已${next ? '显示' : '隐藏'} AI 作品`)
+                } catch (e) {
+                    UI.showMessage(String(e))
+                }
+            },
+        },
+        restricted_mode_settings: {
+            title: "浏览限制(R-18)",
+            type: "callback",
+            buttonText: "查询 / 切换",
+            callback: async () => {
+                try {
+                    let enabled = await this.loadRestrictedModeSetting()
+                    let index = await UI.showSelectDialog("浏览限制(R-18)",
+                        ["不受限 (显示 R-18)", "开启浏览限制 (隐藏 R-18)"], enabled ? 1 : 0)
+                    if (index === null || index === undefined) {
+                        return
+                    }
+                    let next = index === 1
+                    if (next === enabled) {
+                        UI.showMessage("未更改")
+                        return
+                    }
+                    await this.setRestrictedModeSetting(next)
+                    UI.showMessage(next ? "已开启浏览限制 (隐藏 R-18)" : "已关闭浏览限制 (显示 R-18)")
+                } catch (e) {
+                    UI.showMessage(String(e))
+                }
+            },
+        },
+        refresh_recommend_users: {
+            title: "刷新推荐画师",
+            type: "callback",
+            buttonText: "立即刷新",
+            callback: async () => {
+                if (!this.hasAccount(this.activeAccount)) {
+                    UI.showMessage("请先登录")
+                    return
+                }
+                await this.refreshRecommendUsers()
+                UI.showMessage(`推荐画师已更新 (${this.getRecommendUsers().length} 位)`)
+            },
         },
         sub_accounts: {
             title: "附属账号列表",
@@ -1142,6 +1336,7 @@ class Pixiv extends ComicSource {
                     return
                 }
                 this.saveData('active_account', String(index))
+                this.refreshRecommendUsers()
                 UI.showMessage(`已切换到 ${this.accountName(index)}`)
             },
         },
@@ -1192,6 +1387,10 @@ class Pixiv extends ComicSource {
             '登录附属账号': '登录附属账号',
             '清除附属账号': '清除附属账号',
             '切换当前账号': '切换当前账号',
+            'AI 作品显示': 'AI 作品显示',
+            '浏览限制(R-18)': '浏览限制(R-18)',
+            '推荐画师': '推荐画师',
+            '刷新推荐画师': '刷新推荐画师',
         },
         'zh_TW': {
             '推荐插画': '推薦插畫',
@@ -1236,6 +1435,10 @@ class Pixiv extends ComicSource {
             '登录附属账号': '登入附屬帳號',
             '清除附属账号': '清除附屬帳號',
             '切换当前账号': '切換目前帳號',
+            'AI 作品显示': 'AI 作品顯示',
+            '浏览限制(R-18)': '瀏覽限制(R-18)',
+            '推荐画师': '推薦畫師',
+            '刷新推荐画师': '重新整理推薦畫師',
         },
         'en': {
             '推荐插画': 'Recommended Illustrations',
@@ -1280,6 +1483,10 @@ class Pixiv extends ComicSource {
             '登录附属账号': 'Login Sub-accounts',
             '清除附属账号': 'Clear Sub-accounts',
             '切换当前账号': 'Switch Account',
+            'AI 作品显示': 'AI Work Display',
+            '浏览限制(R-18)': 'Restricted Mode (R-18)',
+            '推荐画师': 'Recommended Artists',
+            '刷新推荐画师': 'Refresh Recommended Artists',
         },
     }
 }
